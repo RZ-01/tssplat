@@ -1,0 +1,11 @@
+# Ignore all .DS_Store files (macOS)
+.DS_Store
+
+# Ignore all __pycache__ files
+__pycache__/
+
+# Ignore vscode settings
+.vscode/
+
+# Ignore all image data
+img_data/
