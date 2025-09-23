@@ -10,13 +10,13 @@ import numpy as np
 from PIL import Image
 import torch
 from tqdm import trange, tqdm
-from typing import Optional, Dict, Any
-import yaml
+#from typing import Optional, Dict, Any
+#import yaml
 
 # Add parent directory to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from geometry import load_geometry
+#from geometry import load_geometry
 from materials import load_material
 from utils.config import load_config
 from utils.optimizer import AdamUniform
@@ -51,19 +51,33 @@ class WarpTetMeshGeometry:
     
     def __init__(self, cfg):
         self.cfg = cfg
-        self.optimize_geo = getattr(cfg, 'optimize_geo', True)
-        self.output_path = getattr(cfg, 'output_path', 'results')
+        self.optimize_geo = True
+        self.output_path = cfg.get('output_path', 'results')
         
-        # Load initial tetrahedral mesh
-        init_mesh_path = getattr(cfg, 'init_spheres_path', '../mesh_data/s.1.obj')
+        # Use official config paths - template_surface_sphere_path and key_points_file_path
+        template_mesh_path = cfg.get('template_surface_sphere_path', 'mesh_data/s.1.obj')
+        key_points_path = cfg.get('key_points_file_path', '')
         
-        if os.path.exists(init_mesh_path):
-            self.tetmesh = load_tetmesh_from_surface_mesh(init_mesh_path)
+        # Load from template sphere mesh (like original TetMeshMultiSphereGeometry)
+        if os.path.exists(template_mesh_path):
+            self.tetmesh = load_tetmesh_from_surface_mesh(template_mesh_path)
         else:
             # Create default sphere
             import trimesh
             sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
             self.tetmesh = load_tetmesh_from_surface_mesh(sphere)
+        
+        # Load key points if provided (sphere centers and radii from initialization)
+        self.sphere_centers = None
+        self.sphere_radii = None
+        if key_points_path and os.path.exists(key_points_path):
+            self._load_key_points(key_points_path)
+        
+        # Store smooth barrier parameters from config
+        smooth_barrier_param = cfg.get('smooth_barrier_param', {})
+        self.smooth_eng_coeff = smooth_barrier_param.get('smooth_eng_coeff', 2e-4)
+        self.barrier_coeff = smooth_barrier_param.get('barrier_coeff', 2e-4)
+        self.increase_order_iter = smooth_barrier_param.get('increase_order_iter', 1000)
         
         # Convert to PyTorch tensors
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -76,24 +90,37 @@ class WarpTetMeshGeometry:
         self.surface_fid = torch.from_numpy(self.tetmesh.surface_faces).long().to(device)
         
         # For compatibility with original renderer
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ones_surface_v = torch.ones([self.surface_vid.shape[0], 1]).to(device)
         self.zeros_surface_v = torch.zeros([self.surface_vid.shape[0], 1]).to(device)
         
         print(f"WarpTetMeshGeometry initialized: {len(self.tetmesh.vertices)} vertices, {len(self.tetmesh.elements)} tetrahedra")
     
+    def _load_key_points(self, key_points_path):
+        """Load sphere centers and radii from JSON file (from initialization step)"""
+        import json
+        with open(key_points_path, 'r') as f:
+            data = json.load(f)
+        
+        self.sphere_centers = np.array(data['pt'])
+        self.sphere_radii = np.array(data['r'])
+        print(f"Loaded {len(self.sphere_centers)} key point spheres from {key_points_path}")
+    
     def __call__(self, **kwargs):
         """Forward pass to get geometry data - compatible with original renderer"""
         from warp_tetmesh import WarpBarrierEnergy
         
-        # Compute barrier energy using Warp
+        # Get iteration number for barrier order scheduling
+        iter_num = kwargs.get('iter_num', 0)
+        barrier_order = 3 if iter_num > self.increase_order_iter else 2
+        
+        # Compute barrier energy using Warp with config parameters
         barrier_energy = WarpBarrierEnergy.apply(
             self.tet_v,
             self.tet_elements.flatten().int(),
             self.rest_matrices,
-            1e-4,  # smoothness weight
-            1e-4,  # barrier weight
-            2      # barrier order
+            self.smooth_eng_coeff,  # Use config value
+            self.barrier_coeff,     # Use config value
+            barrier_order           # Increase order after specified iteration
         )
         
         # Return geometry data in expected format for original renderer
@@ -160,46 +187,42 @@ class WarpTetMeshGeometry:
 
 
 def train_warp_tetsplat(cfg):
-    """Main training function - directly copied logic from original trainer.py"""
+    """Main training function - supports official config format"""
     verbose = cfg.get("verbose", False)
     
     # Setup material
     material = None
     os.makedirs(os.path.join(cfg.output_path, "final/"), exist_ok=True)
     
-    # Loss function setup (same as original)
-    shade_loss = torch.nn.MSELoss()
+    # Loss function setup - use Warp native image loss
+    warp_loss = WarpImageLoss()
     if cfg.get("fitting_stage", None) == "texture":
         assert cfg.get("material", None) is not None
         material = load_material(cfg.material_type)(cfg.material)
-        shade_loss = torch.nn.L1Loss()
     
-    # Load geometry
-    if hasattr(cfg, 'geometry_type'):
-        # Use original geometry loader
-        cfg.geometry.optimize_geo = True
-        cfg.geometry.output_path = cfg.output_path
-        geometry = load_geometry(cfg.geometry_type)(cfg.geometry)
-    else:
-        # Use Warp geometry
-        geometry = WarpTetMeshGeometry(cfg.geometry if hasattr(cfg, 'geometry') else cfg)
+    # Load geometry - use Warp implementation that matches TetMeshMultiSphereGeometry
+    geometry = WarpTetMeshGeometry(cfg.geometry)
     
-    # Use renderer (original or simplified)
-    renderer = MeshRasterizer(geometry, material, cfg.renderer if hasattr(cfg, 'renderer') else {})
+    # Use renderer (original) 
+    renderer = MeshRasterizer(geometry, material, cfg.renderer)
     
-    # Use Warp dataloader
-    dataset_class = load_warp_dataloader(cfg.dataloader_type)
+    # Use Warp dataloader with official config format
+    # Map official dataloader names to Warp implementations
+    dataloader_mapping = {
+        "MistubaImgDataLoader": "mitsuba",
+        "Wonder3DDataLoader": "wonder3d", 
+        "BlenderDataLoader": "blender"
+    }
+    
+    warp_dataloader_type = dataloader_mapping.get(cfg.dataloader_type, cfg.dataloader_type.lower())
+    dataset_class = load_warp_dataloader(warp_dataloader_type)
     dataset = dataset_class(cfg.data)
     dataloader = WarpDataLoader(dataset, cfg.data)
     
-    # Setup loss function
-    loss_fn = WarpImageLoss()
-    
     num_forward_per_iter = dataloader.num_forward_per_iter
     
-    # Optimizer
+    # Optimizer - use AdamUniform to match original trainer
     optimizer = AdamUniform(renderer.parameters(), **cfg.optimizer)
-        
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, cfg.total_num_iter * num_forward_per_iter, eta_min=1e-4)
     
@@ -247,44 +270,45 @@ def train_warp_tetsplat(cfg):
             # Forward pass
             out = renderer(**renderer_input)
             
-            # Compute losses - using original trainer logic
-            img_loss = None
-            if cfg.get("fitting_stage", None) == "geometry":
-                img_loss = shade_loss(out["shaded"][..., -1],
-                                    color_ref[0][..., -1])  # Alpha channel only
-            else:
-                img_loss = shade_loss(
-                    out["shaded"][..., :3], color_ref[0][..., :3])  # RGB channels
-            img_loss *= 20
+            # Compute losses - using Warp native loss functions
+            img_loss = warp_loss.compute_image_loss(
+                out["shaded"], 
+                color_ref,
+                fitting_stage=cfg.get("fitting_stage", "geometry"),
+                loss_type="mse" if cfg.get("fitting_stage", None) == "geometry" else "l1"
+            )
             
-            # Depth loss
+            # Depth loss using Warp native method
             if fit_depth:
-                img_loss += shade_loss(out["d"][..., -1] * color_ref[0][..., -1],
-                                     batch["d"][0][..., -1] * color_ref[0][..., -1]) * 100
+                depth_loss = warp_loss.compute_depth_loss(
+                    out["d"][..., -1:],  # Keep channel dimension
+                    batch["d"][..., -1:],  # Keep channel dimension
+                    color_ref[..., -1:]   # Alpha mask
+                )
+                img_loss += depth_loss
             
             # Regularization loss
             reg_loss = 0.0
             if cfg.get("fitting_stage", None) == "geometry":
                 reg_loss = out["geo_regularization"]
             
-            total_loss = img_loss * 100 + reg_loss
+            loss = img_loss * 100 + reg_loss
             
             # Logging (same format as original)
-            if it % 10 == 0 or True:
+            if True:  # it % 100 == 0:
                 tqdm.write(
                     "iter=%4d, img_loss=%.4f, reg_loss=%.4f"
-                    % (it, img_loss.item() if hasattr(img_loss, 'item') else img_loss, 
-                       reg_loss.item() if hasattr(reg_loss, 'item') else reg_loss)
+                    % (it, img_loss, reg_loss)
                 )
             
             # Backward pass (same as original)
             optimizer.zero_grad(set_to_none=True)
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
             scheduler.step()
             
             # Best model tracking (same as original)
-            cur_loss = total_loss.clone().detach().cpu().item()
+            cur_loss = loss.clone().detach().cpu().item()
             if cur_loss < best_loss:
                 best_loss = cur_loss
                 best_loss_iter = it
@@ -298,34 +322,36 @@ def train_warp_tetsplat(cfg):
                 geometry.export(f"{cfg.output_path}/mesh{it:05d}", f"{it:05d}")
                 
                 if verbose:
-                    # Save rendered image
-                    opt_img = out["shaded"].clone().detach()
+                    chosen_idx = np.random.randint(0, batch["img"].shape[0])
+                    opt_img = out["shaded"][chosen_idx].clone().detach()
+                    # Save images
                     img = opt_img.cpu().numpy()
-                    
-                    if len(img.shape) == 3 and img.shape[2] == 1:
+
+                    print(img.shape)
+                    if img.shape[2] == 1:
                         img = np.concatenate([img, img, img, img], axis=2)
-                    elif len(img.shape) == 3 and img.shape[2] == 4:
-                        pass  # Already RGBA
-                    
+
                     img = np.clip(img * 255, 0, 255).astype(np.uint8)
                     img = Image.fromarray(img)
                     img.save("{}/a_ours-{}.png".format(cfg.output_path, it))
-                    
-                    # Save ground truth
-                    img = color_ref[0].cpu().numpy()
-                    if len(img.shape) == 3 and img.shape[2] == 1:
+
+                    img = color_ref[chosen_idx].cpu().numpy()
+                    print(img.shape)
+                    if img.shape[2] == 1:
                         img = np.concatenate([img, img, img, img], axis=2)
-                    
+
                     img = np.clip(img * 255, 0, 255).astype(np.uint8)
                     img = Image.fromarray(img)
                     img.save("{}/a_gt-{}.png".format(cfg.output_path, it))
-                    
-                    # Save difference for geometry stage
+
                     if cfg.get("fitting_stage", None) == "geometry":
-                        diff = color_ref[0].cpu().numpy()[..., -1:] - opt_img.cpu().numpy()[..., -1:]
+                        diff = color_ref[chosen_idx].cpu().numpy()[..., -1:] - opt_img.cpu().numpy()[..., -1:]
+                        # Save images
                         img = np.abs(diff)
+                        print(img.shape)
                         if img.shape[2] == 1:
                             img = np.concatenate([img, img, img, img], axis=2)
+
                         img = np.clip(img * 255, 0, 255).astype(np.uint8)
                         img = Image.fromarray(img)
                         img.save("{}/a_diff-{}.png".format(cfg.output_path, it))
@@ -347,162 +373,22 @@ def train_warp_tetsplat(cfg):
     }
 
 
-def create_warp_config(output_path: str = "config/warp_tetsplat_example.yaml"):
-    """Create example configuration for Warp TetSplatting"""
-    config = {
-        # Output settings
-        'output_path': 'results/warp_tetsplat',
-        'verbose': True,
-        
-        # Training settings
-        'total_num_iter': 2000,
-        'fitting_stage': 'geometry',  # or 'texture'
-        
-        # Geometry settings
-        'geometry_type': 'tetmesh_geometry',
-        'geometry': {
-            'tet_bbox': [[-1, -1, -1], [1, 1, 1]],
-            'init_spheres_path': '../mesh_data/s.1.obj',  # Use paper's template
-            'n_init_spheres': 1,
-            'subdivide_depth': 2,
-            'position_noise_deg': 0.0,
-            'sphere_pertube_dev': 0.0,
-            'optimize_geo': True,
-        },
-        
-        # Renderer settings
-        'renderer': {
-            'context_type': 'cuda',
-            'is_orthographic': False
-        },
-        
-        # Data settings - Wonder3D format
-        'dataloader_type': 'wonder3d',
-        'data': {
-            'batch_size': 1,
-            'total_num_iter': 2000,
-            'world_size': 1,
-            'rank': 0,
-            'camera_mvp_root': 'data/wonder3d/cameras',
-            'camera_views': ['000', '045', '090', '135', '180', '225', '270', '315'],
-            'image_root': 'data/wonder3d/images'
-        },
-        
-        # Optimizer settings (same as original)
-        'optimizer': {
-            'lr': 0.01,
-            'betas': [0.9, 0.99],
-            'eps': 1e-8
-        },
-        
-        # Permute surface settings
-        'use_permute_surface_v': True,
-        'permute_surface_v_param': {
-            'start_iter': 0,
-            'end_iter': 1000,
-            'start_val': 0.01,
-            'end_val': 0.001,
-            'freq': 100
-        },
-        
-        # Loss settings  
-        'fit_depth': False,
-        'fit_depth_starting_iter': 1000,
-    }
-    
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, indent=2)
-    
-    print(f"Example config saved to: {output_path}")
-    return output_path
 
-
-def create_blender_config(output_path: str = "config/warp_blender_example.yaml"):
-    """Create Blender dataset configuration"""
-    config = {
-        # Output settings
-        'output_path': 'results/warp_blender',
-        'verbose': True,
-        
-        # Training settings
-        'total_num_iter': 1000,
-        'fitting_stage': 'geometry',
-        
-        # Geometry settings
-        'geometry': {
-            'init_spheres_path': '../mesh_data/s.1.obj',
-            'optimize_geo': True,
-        },
-        
-        # Renderer settings
-        'renderer': {
-            'context_type': 'cpu',  # Use CPU for compatibility
-            'is_orthographic': False
-        },
-        
-        # Data settings - Blender format
-        'dataloader_type': 'blender',
-        'data': {
-            'batch_size': 1,
-            'total_num_iter': 1000,
-            'world_size': 1,
-            'rank': 0,
-            'image_root': 'data/blender_scene',  # Should contain transforms.json
-            'resolution': 512
-        },
-        
-        # Optimizer settings
-        'optimizer': {
-            'lr': 0.01,
-            'betas': [0.9, 0.99],
-            'eps': 1e-8
-        },
-        
-        # Permute surface settings
-        'use_permute_surface_v': False,
-        
-        # Loss settings  
-        'fit_depth': False,
-    }
-    
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, indent=2)
-    
-    print(f"Blender config saved to: {output_path}")
-    return output_path
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Complete Warp-based TetSplatting trainer")
-    parser.add_argument("--config", type=str, help="Path to config file")
-    parser.add_argument("--create-example-config", action="store_true",
-                        help="Create Wonder3D example configuration file")
-    parser.add_argument("--create-blender-config", action="store_true",
-                        help="Create Blender example configuration file")
+    parser = argparse.ArgumentParser(description="Warp-based TetSplatting trainer - supports official config format")
+    parser.add_argument("--config", type=str, required=True, help="Path to official config file (e.g., img_to_3D.yaml)")
     
     args, extras = parser.parse_known_args()
     
-    if args.create_example_config:
-        create_warp_config()
-        print("Wonder3D example config created!")
-        print("Usage: python warp_tetsplat_trainer.py --config config/warp_tetsplat_example.yaml")
-    elif args.create_blender_config:
-        create_blender_config()
-        print("Blender example config created!")
-        print("Usage: python warp_tetsplat_trainer.py --config config/warp_blender_example.yaml")
-    elif args.config:
-        cfg = load_config(args.config, cli_args=extras)
-        print("Starting Warp TetSplatting training...")
-        results = train_warp_tetsplat(cfg)
-        print("Training completed!")
-        print(f"Best loss: {results['best_loss']} at iteration {results['best_loss_iter']}")
-    else:
-        print("Complete Warp TetSplatting Trainer")
-        print("Usage:")
-        print("  python warp_tetsplat_trainer.py --create-example-config")
-        print("  python warp_tetsplat_trainer.py --create-blender-config")  
-        print("  python warp_tetsplat_trainer.py --config <config_file>")
-        print()
-        print("Available dataset types: wonder3d, mitsuba, blender")
+    cfg = load_config(args.config, cli_args=extras)
+    print("Starting Warp TetSplatting training with official config...")
+    print(f"Config: {args.config}")
+    print(f"Experiment: {cfg.expr_name}")
+    print(f"Geometry type: {cfg.geometry_type}")
+    print(f"Dataloader type: {cfg.dataloader_type}")
+    
+    results = train_warp_tetsplat(cfg)
+    print("Training completed!")
+    print(f"Best loss: {results['best_loss']} at iteration {results['best_loss_iter']}")

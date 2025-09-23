@@ -1,9 +1,0 @@
-barrier_loss_weight: 0.0001
-geometric_loss_weight: 1.0
-initial_mesh_path: ../mesh_data/s.1.obj
-learning_rate: 0.01
-output_path: results/simple_warp_test
-resolution: 256
-smoothness_loss_weight: 0.0001
-target_type: synthetic
-total_num_iter: 100
