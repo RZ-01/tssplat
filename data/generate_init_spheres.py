@@ -517,7 +517,7 @@ def main(tgt_path, mesh_name, save_path, radius_scale=1.1, offset=0.06, pc_res=5
     ################
 
     # generate_rough_sdf(img, mvp, pc_res,  pt_mesh_path, True)
-    # print("generate pc done")
+    print("start generate surf")
     generate_rough_sdf(img, mvp, surf_res, surf_mesh_path, False)
     print("generate surf done")
     ################

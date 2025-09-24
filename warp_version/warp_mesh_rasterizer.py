@@ -10,9 +10,27 @@ import os
 from typing import Optional, Dict
 from dataclasses import dataclass
 
-from geometry.tetmesh_geometry import TetMeshGeometry
-from materials import ExplicitMaterial
-from utils.config import parse_structured, get_device
+# Avoid importing original geometry to prevent pypgo dependency
+# from geometry.tetmesh_geometry import TetMeshGeometry
+# from materials import ExplicitMaterial
+# from utils.config import parse_structured, get_device
+
+# Simple helper functions to avoid dependency issues
+def get_device():
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def parse_structured(config_class, cfg_dict):
+    if cfg_dict is None:
+        return config_class()
+    
+    # Filter out unknown parameters to avoid TypeError
+    import inspect
+    sig = inspect.signature(config_class.__init__)
+    valid_params = set(sig.parameters.keys()) - {'self'}
+    
+    filtered_dict = {k: v for k, v in cfg_dict.items() if k in valid_params}
+    
+    return config_class(**filtered_dict)
 
 
 @wp.kernel
@@ -165,7 +183,7 @@ class WarpRasterizationFunction(torch.autograd.Function):
         num_vertices = vertices.shape[0]
         num_triangles = triangle_indices.shape[0] // 3
         
-        with wp.ScopedDevice(device.index if device.type == 'cuda' else 'cpu'):
+        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
             # Convert inputs to Warp arrays
             vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
             indices_wp = wp.from_torch(triangle_indices.contiguous().int(), dtype=wp.int32)
@@ -233,11 +251,11 @@ class WarpMeshRasterizer(torch.nn.Module):
     @dataclass
     class Config:
         context_type: str = "cuda"  # For compatibility, but we use Warp
-        is_orthographic: bool = False
+        is_orhto: bool = False  # Match original spelling error
     
-    def __init__(self, geometry: TetMeshGeometry, 
-                 materials: Optional[ExplicitMaterial],
-                 cfg: Optional[Dict] = None):
+    def __init__(self, geometry, 
+                 materials=None,
+                 cfg=None):
         super().__init__()
         
         self.cfg = parse_structured(self.Config, cfg) if cfg else self.Config()
@@ -269,7 +287,7 @@ class WarpMeshRasterizer(torch.nn.Module):
             res = torch.matmul(posw, t_mtx.transpose(1, 2))
         
         # Orthographic projection adjustment
-        if not is_vec and self.cfg.is_orthographic:
+        if not is_vec and self.cfg.is_orhto:  # Match original parameter name
             res[..., 2] /= 6
             
         return res
@@ -302,7 +320,7 @@ class WarpMeshRasterizer(torch.nn.Module):
             geometry_forward_data.t_pos_idx.flatten(),
             mvp,
             resolution,
-            self.cfg.is_orthographic
+            self.cfg.is_orhto  # Match original parameter name
         )
         
         # Compute alpha
@@ -340,9 +358,21 @@ class WarpMeshRasterizer(torch.nn.Module):
             else:
                 shaded = background
         
+        # Ensure shaded has proper shape (add batch dimension if needed)
+        if len(shaded.shape) == 3:  # (H, W, C)
+            shaded = shaded.unsqueeze(0)  # (1, H, W, C)
+        
+        # Handle regularization energy - return 0.0 if None or not present
+        geo_reg = None
+        if hasattr(geometry_forward_data, 'smooth_barrier_energy'):
+            geo_reg = geometry_forward_data.smooth_barrier_energy
+        
+        if geo_reg is None:
+            geo_reg = torch.tensor(0.0, device=self.device)
+        
         out = {
             "shaded": shaded,
-            "geo_regularization": geometry_forward_data.smooth_barrier_energy
+            "geo_regularization": geo_reg
         }
         
         # Additional outputs
@@ -356,9 +386,11 @@ class WarpMeshRasterizer(torch.nn.Module):
             out["n"] = torch.zeros_like(shaded)
         
         if fit_depth:
-            assert campos is not None
-            # TODO: Proper depth interpolation
-            out["d"] = torch.zeros(resolution, resolution, 1, device=self.device)
+            # Return depth buffer from rasterization
+            depth = rast_out[..., 2:3]  # Z-buffer values
+            if len(depth.shape) == 3:  # Add batch dimension if needed
+                depth = depth.unsqueeze(0)
+            out["d"] = depth
         
         return out
     

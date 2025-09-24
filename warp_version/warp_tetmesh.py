@@ -140,7 +140,7 @@ class WarpBarrierEnergy(torch.autograd.Function):
         num_tets = tet_elements.shape[0] // 4
         
         # Convert to Warp arrays
-        with wp.ScopedDevice(device.index if device.type == 'cuda' else 'cpu'):
+        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
             vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
             elements_wp = wp.from_torch(tet_elements.contiguous().int(), dtype=wp.int32)  # Convert to int32
             rest_wp = wp.from_torch(rest_matrices.contiguous(), dtype=wp.mat33)
@@ -184,7 +184,7 @@ class WarpBarrierEnergy(torch.autograd.Function):
         num_vertices = vertices.shape[0]
         num_tets = tet_elements.shape[0] // 4
         
-        with wp.ScopedDevice(device.index if device.type == 'cuda' else 'cpu'):
+        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
             vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
             elements_wp = wp.from_torch(tet_elements.contiguous().int(), dtype=wp.int32)  # Convert to int32
             rest_wp = wp.from_torch(rest_matrices.contiguous(), dtype=wp.mat33)

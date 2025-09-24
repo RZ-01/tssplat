@@ -10,27 +10,40 @@ import numpy as np
 from PIL import Image
 import torch
 from tqdm import trange, tqdm
-#from typing import Optional, Dict, Any
-#import yaml
 
-# Add parent directory to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-#from geometry import load_geometry
-from materials import load_material
+# Conditional import of materials only when needed to avoid nvdiffrast dependency
+try:
+    from materials import load_material
+    MATERIALS_AVAILABLE = True
+except ImportError:
+    MATERIALS_AVAILABLE = False
+    print("Warning: Materials not available (nvdiffrast not installed)")
+
 from utils.config import load_config
 from utils.optimizer import AdamUniform
 
-from renderers import MeshRasterizer
+# Skip original renderer import to avoid pypgo dependency
+# from renderers import MeshRasterizer
+from warp_mesh_rasterizer import WarpMeshRasterizer
 
 from warp_dataloader import WarpDataLoader, load_warp_dataloader
 from warp_image_loss import WarpImageLoss
 from warp_tetmesh import WarpTetMesh, load_tetmesh_from_surface_mesh
+from warp_geometry import load_warp_geometry
+
+
+class TetMeshGeometryForwardData:
+    def __init__(self, tet_v, tet_elem, surface_vid, surface_f, smooth_barrier_energy=None):
+        self.tet_v = tet_v
+        self.tet_elem = tet_elem
+        self.v_pos = tet_v[surface_vid] if surface_vid is not None else tet_v
+        self.t_pos_idx = surface_f
+        self.smooth_barrier_energy = smooth_barrier_energy
 
 
 class LinearInterpolateScheduler:
-    """Linear interpolation scheduler - directly copied from original"""
-    
     def __init__(self, start_iter, end_iter, start_val, end_val, freq):
         self.start_iter = start_iter
         self.end_iter = end_iter
@@ -46,28 +59,23 @@ class LinearInterpolateScheduler:
         return self.start_val * (1 - p) + self.end_val * p
 
 
-class WarpTetMeshGeometry:
-    """Warp-based geometry wrapper for compatibility with original trainer and renderer"""
-    
+class WarpTetMeshGeometry(torch.nn.Module):
     def __init__(self, cfg):
+        super().__init__()
         self.cfg = cfg
         self.optimize_geo = True
         self.output_path = cfg.get('output_path', 'results')
         
-        # Use official config paths - template_surface_sphere_path and key_points_file_path
         template_mesh_path = cfg.get('template_surface_sphere_path', 'mesh_data/s.1.obj')
         key_points_path = cfg.get('key_points_file_path', '')
         
-        # Load from template sphere mesh (like original TetMeshMultiSphereGeometry)
         if os.path.exists(template_mesh_path):
             self.tetmesh = load_tetmesh_from_surface_mesh(template_mesh_path)
         else:
-            # Create default sphere
             import trimesh
             sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
             self.tetmesh = load_tetmesh_from_surface_mesh(sphere)
         
-        # Load key points if provided (sphere centers and radii from initialization)
         self.sphere_centers = None
         self.sphere_radii = None
         if key_points_path and os.path.exists(key_points_path):
@@ -81,8 +89,11 @@ class WarpTetMeshGeometry:
         
         # Convert to PyTorch tensors
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.tet_v = torch.from_numpy(self.tetmesh.vertices).float().to(device)
-        self.tet_v.requires_grad_(True)
+        tet_v = torch.from_numpy(self.tetmesh.vertices).float().to(device)
+        tet_v.requires_grad_(True)
+        
+        # Register as parameter so optimizer can find it
+        self.tet_v = torch.nn.Parameter(tet_v)
         
         self.tet_elements = torch.from_numpy(self.tetmesh.elements).long().to(device)
         self.rest_matrices = torch.from_numpy(self.tetmesh.rest_matrices).float().to(device)
@@ -96,7 +107,6 @@ class WarpTetMeshGeometry:
         print(f"WarpTetMeshGeometry initialized: {len(self.tetmesh.vertices)} vertices, {len(self.tetmesh.elements)} tetrahedra")
     
     def _load_key_points(self, key_points_path):
-        """Load sphere centers and radii from JSON file (from initialization step)"""
         import json
         with open(key_points_path, 'r') as f:
             data = json.load(f)
@@ -106,14 +116,11 @@ class WarpTetMeshGeometry:
         print(f"Loaded {len(self.sphere_centers)} key point spheres from {key_points_path}")
     
     def __call__(self, **kwargs):
-        """Forward pass to get geometry data - compatible with original renderer"""
         from warp_tetmesh import WarpBarrierEnergy
         
-        # Get iteration number for barrier order scheduling
         iter_num = kwargs.get('iter_num', 0)
         barrier_order = 3 if iter_num > self.increase_order_iter else 2
         
-        # Compute barrier energy using Warp with config parameters
         barrier_energy = WarpBarrierEnergy.apply(
             self.tet_v,
             self.tet_elements.flatten().int(),
@@ -189,35 +196,51 @@ class WarpTetMeshGeometry:
 def train_warp_tetsplat(cfg):
     """Main training function - supports official config format"""
     verbose = cfg.get("verbose", False)
-    
     # Setup material
     material = None
     os.makedirs(os.path.join(cfg.output_path, "final/"), exist_ok=True)
     
-    # Loss function setup - use Warp native image loss
-    warp_loss = WarpImageLoss()
+    # Loss function setup - match original trainer exactly  
+    shade_loss = torch.nn.MSELoss()
     if cfg.get("fitting_stage", None) == "texture":
+        if not MATERIALS_AVAILABLE:
+            raise ImportError("Materials not available for texture fitting stage. Please install nvdiffrast.")
         assert cfg.get("material", None) is not None
         material = load_material(cfg.material_type)(cfg.material)
+        shade_loss = torch.nn.L1Loss()
     
-    # Load geometry - use Warp implementation that matches TetMeshMultiSphereGeometry
-    geometry = WarpTetMeshGeometry(cfg.geometry)
+    # Load geometry - use dynamic loading to match original trainer exactly
+    geometry_class = load_warp_geometry(cfg.geometry_type)
+    geometry = geometry_class(cfg.geometry)
     
-    # Use renderer (original) 
-    renderer = MeshRasterizer(geometry, material, cfg.renderer)
+    # Use Warp renderer to avoid pypgo dependency
+    renderer = WarpMeshRasterizer(geometry, material, cfg.renderer)
     
     # Use Warp dataloader with official config format
-    # Map official dataloader names to Warp implementations
+    # Map official dataloader names to Warp implementations with fallback
     dataloader_mapping = {
         "MistubaImgDataLoader": "mitsuba",
         "Wonder3DDataLoader": "wonder3d", 
-        "BlenderDataLoader": "blender"
+        "BlenderDataLoader": "blender",
+        "GSO_DataLoader": "gso",
+        "NeRFDataLoader": "nerf"
     }
     
-    warp_dataloader_type = dataloader_mapping.get(cfg.dataloader_type, cfg.dataloader_type.lower())
-    dataset_class = load_warp_dataloader(warp_dataloader_type)
-    dataset = dataset_class(cfg.data)
-    dataloader = WarpDataLoader(dataset, cfg.data)
+    # Try mapped name first, then direct name, then default fallback
+    warp_dataloader_type = dataloader_mapping.get(cfg.dataloader_type, cfg.dataloader_type)
+    
+    try:
+        dataset_class = load_warp_dataloader(warp_dataloader_type)
+    except (NotImplementedError, ImportError) as e:
+        print(f"Warning: Warp dataloader '{warp_dataloader_type}' not found, trying lowercase...")
+        try:
+            dataset_class = load_warp_dataloader(cfg.dataloader_type.lower())
+        except:
+            print(f"Error: No Warp implementation found for dataloader '{cfg.dataloader_type}'")
+            print("Available Warp dataloaders:", list(dataloader_mapping.values()))
+            raise NotImplementedError(f"Unsupported dataloader type: {cfg.dataloader_type}")
+    
+    dataloader = dataset_class(cfg.data)  # cfg.data contains all dataloader config
     
     num_forward_per_iter = dataloader.num_forward_per_iter
     
@@ -270,21 +293,19 @@ def train_warp_tetsplat(cfg):
             # Forward pass
             out = renderer(**renderer_input)
             
-            # Compute losses - using Warp native loss functions
-            img_loss = warp_loss.compute_image_loss(
-                out["shaded"], 
-                color_ref,
-                fitting_stage=cfg.get("fitting_stage", "geometry"),
-                loss_type="mse" if cfg.get("fitting_stage", None) == "geometry" else "l1"
-            )
+            # Compute losses - match original trainer exactly
+            if cfg.get("fitting_stage", None) == "geometry":
+                # Geometry fitting: MSE loss on alpha channel (like original)
+                img_loss = shade_loss(out["shaded"][..., -1], color_ref[..., -1])
+            else:
+                # Texture fitting: L1 loss on RGB channels
+                img_loss = shade_loss(out["shaded"][..., :3], color_ref[..., :3])
             
-            # Depth loss using Warp native method
+            img_loss *= 20  # Match original scaling
+            
+            # Depth loss (same as original)
             if fit_depth:
-                depth_loss = warp_loss.compute_depth_loss(
-                    out["d"][..., -1:],  # Keep channel dimension
-                    batch["d"][..., -1:],  # Keep channel dimension
-                    color_ref[..., -1:]   # Alpha mask
-                )
+                depth_loss = torch.nn.MSELoss()(out["d"][..., -1], batch["d"][..., -1])
                 img_loss += depth_loss
             
             # Regularization loss

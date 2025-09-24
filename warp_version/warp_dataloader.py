@@ -123,8 +123,9 @@ class WarpMistubaImgDataset:
     class Config:
         image_root: str
 
-    def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None):
-        self.cfg = parse_structured(self.Config, cfg)
+    def __init__(self, cfg):  # Accept direct config object, not parsed dict
+        # cfg should be already parsed MistubaImgDataset.Config
+        self.cfg = cfg
         
         # Load image data (same as original)
         self.all_tgt_imgs, self.all_mvp_mats, self.all_mv_mats, self.all_campos, self.all_tgt_ns, self.all_tgt_ds = self.load_img_data()
@@ -351,12 +352,83 @@ class WarpDataLoader:
         return self.n_images
 
 
+class WarpMistubaImgDataLoader:
+    """Warp version of MistubaImgDataLoader - matches original structure"""
+    
+    @dataclass 
+    class Config:
+        batch_size: int
+        total_num_iter: int
+        world_size: int = 1
+        rank: int = 0
+        dataset_config: WarpMistubaImgDataset.Config = None
+
+    def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None):
+        self.cfg = parse_structured(self.Config, cfg)
+        self.device = get_device()
+        
+        # Create dataset using dataset_config
+        self.dataset = WarpMistubaImgDataset(self.cfg.dataset_config)
+        
+        # Prepare data (same as original)
+        self.prepare_data()
+    
+    def prepare_data(self):
+        """Prepare data - copied from original"""
+        # Convert to torch tensors (same as original DataLoader.to_torch)
+        self.img = torch.tensor(np.array(self.dataset.all_tgt_imgs),
+                               dtype=torch.float32).to(self.device)
+        self.n = torch.tensor(np.array(self.dataset.all_tgt_ns),
+                             dtype=torch.float32).to(self.device)
+        self.d = torch.tensor(np.array(self.dataset.all_tgt_ds),
+                             dtype=torch.float32).to(self.device)
+        self.mv = torch.tensor(np.array(self.dataset.all_mv_mats),
+                              dtype=torch.float32).to(self.device)
+        self.campos = torch.tensor(np.array(self.dataset.all_campos),
+                                  dtype=torch.float32).to(self.device)
+        self.mvp = torch.tensor(np.array(self.dataset.all_mvp_mats),
+                               dtype=torch.float32).to(self.device)
+        self.bg = torch.tensor(np.array(self.dataset.bgs),
+                              dtype=torch.float32).to(self.device)
+        
+        # Apply background blending (same as original)
+        self.img = torch.cat(
+            (torch.lerp(self.bg, self.img[..., 0:3], self.img[..., 3:4]), self.img[..., 3:4]), dim=-1)
+        
+        # Set properties
+        self.n_images = len(self.dataset.all_tgt_imgs)
+        self.num_forward_per_iter = max(1, self.cfg.batch_size // self.n_images)
+        self.resolution = self.dataset.resolution
+        
+    def __len__(self):
+        return self.n_images
+    
+    def __call__(self, iter_num, forw_id):
+        """Generate batch - same logic as original"""
+        with torch.no_grad():
+            # Random indices selection (same as original)
+            indices = np.random.randint(0, self.n_images, size=self.cfg.batch_size)
+            
+            batch = {
+                "img": self.img[indices],
+                "n": self.n[indices] if hasattr(self, 'n') else None,
+                "d": self.d[indices] if hasattr(self, 'd') else None,
+                "mvp": self.mvp[indices],
+                "mv": self.mv[indices],
+                "campos": self.campos[indices],
+                "background": self.bg[indices],
+                "resolution": self.resolution
+            }
+        
+        return batch
+
+
 def load_warp_dataloader(dataset_type: str):
     """Factory function to load appropriate dataset type"""
     if dataset_type == "wonder3d":
         return WarpWonder3DImgDataset
     elif dataset_type == "mitsuba":
-        return WarpMistubaImgDataset
+        return WarpMistubaImgDataLoader  # Return the dataloader, not dataset
     elif dataset_type == "blender":
         return WarpBlenderImgDataset
     else:
