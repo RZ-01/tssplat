@@ -59,140 +59,6 @@ class LinearInterpolateScheduler:
         return self.start_val * (1 - p) + self.end_val * p
 
 
-class WarpTetMeshGeometry(torch.nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.optimize_geo = True
-        self.output_path = cfg.get('output_path', 'results')
-        
-        template_mesh_path = cfg.get('template_surface_sphere_path', 'mesh_data/s.1.obj')
-        key_points_path = cfg.get('key_points_file_path', '')
-        
-        if os.path.exists(template_mesh_path):
-            self.tetmesh = load_tetmesh_from_surface_mesh(template_mesh_path)
-        else:
-            import trimesh
-            sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
-            self.tetmesh = load_tetmesh_from_surface_mesh(sphere)
-        
-        self.sphere_centers = None
-        self.sphere_radii = None
-        if key_points_path and os.path.exists(key_points_path):
-            self._load_key_points(key_points_path)
-        
-        # Store smooth barrier parameters from config
-        smooth_barrier_param = cfg.get('smooth_barrier_param', {})
-        self.smooth_eng_coeff = smooth_barrier_param.get('smooth_eng_coeff', 2e-4)
-        self.barrier_coeff = smooth_barrier_param.get('barrier_coeff', 2e-4)
-        self.increase_order_iter = smooth_barrier_param.get('increase_order_iter', 1000)
-        
-        # Convert to PyTorch tensors
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        tet_v = torch.from_numpy(self.tetmesh.vertices).float().to(device)
-        tet_v.requires_grad_(True)
-        
-        # Register as parameter so optimizer can find it
-        self.tet_v = torch.nn.Parameter(tet_v)
-        
-        self.tet_elements = torch.from_numpy(self.tetmesh.elements).long().to(device)
-        self.rest_matrices = torch.from_numpy(self.tetmesh.rest_matrices).float().to(device)
-        self.surface_vid = torch.from_numpy(self.tetmesh.surface_vertices).long().to(device)
-        self.surface_fid = torch.from_numpy(self.tetmesh.surface_faces).long().to(device)
-        
-        # For compatibility with original renderer
-        self.ones_surface_v = torch.ones([self.surface_vid.shape[0], 1]).to(device)
-        self.zeros_surface_v = torch.zeros([self.surface_vid.shape[0], 1]).to(device)
-        
-        print(f"WarpTetMeshGeometry initialized: {len(self.tetmesh.vertices)} vertices, {len(self.tetmesh.elements)} tetrahedra")
-    
-    def _load_key_points(self, key_points_path):
-        import json
-        with open(key_points_path, 'r') as f:
-            data = json.load(f)
-        
-        self.sphere_centers = np.array(data['pt'])
-        self.sphere_radii = np.array(data['r'])
-        print(f"Loaded {len(self.sphere_centers)} key point spheres from {key_points_path}")
-    
-    def __call__(self, **kwargs):
-        from warp_tetmesh import WarpBarrierEnergy
-        
-        iter_num = kwargs.get('iter_num', 0)
-        barrier_order = 3 if iter_num > self.increase_order_iter else 2
-        
-        barrier_energy = WarpBarrierEnergy.apply(
-            self.tet_v,
-            self.tet_elements.flatten().int(),
-            self.rest_matrices,
-            self.smooth_eng_coeff,  # Use config value
-            self.barrier_coeff,     # Use config value
-            barrier_order           # Increase order after specified iteration
-        )
-        
-        # Return geometry data in expected format for original renderer
-        class GeometryData:
-            def __init__(self, v_pos, t_pos_idx, smooth_barrier_energy):
-                self.v_pos = v_pos  # Surface vertex positions
-                self.t_pos_idx = t_pos_idx  # Surface face indices
-                self.smooth_barrier_energy = smooth_barrier_energy
-            
-            def _compute_vertex_normal(self):
-                """Compute vertex normals for surface vertices"""
-                # Simple normal computation using face normals
-                faces = self.t_pos_idx
-                vertices = self.v_pos
-                
-                # Get face vertices
-                v0 = vertices[faces[:, 0]]
-                v1 = vertices[faces[:, 1]] 
-                v2 = vertices[faces[:, 2]]
-                
-                # Compute face normals
-                face_normals = torch.cross(v1 - v0, v2 - v0, dim=1)
-                face_normals = torch.nn.functional.normalize(face_normals, dim=1)
-                
-                # Average face normals to get vertex normals
-                vertex_normals = torch.zeros_like(vertices)
-                for i in range(faces.shape[0]):
-                    vertex_normals[faces[i, 0]] += face_normals[i]
-                    vertex_normals[faces[i, 1]] += face_normals[i]
-                    vertex_normals[faces[i, 2]] += face_normals[i]
-                
-                vertex_normals = torch.nn.functional.normalize(vertex_normals, dim=1)
-                return vertex_normals
-        
-        return GeometryData(
-            v_pos=self.tet_v[self.surface_vid],  # Surface vertices only
-            t_pos_idx=self.surface_fid,  # Surface faces
-            smooth_barrier_energy=barrier_energy
-        )
-    
-    def parameters(self):
-        """Return parameters for optimizer"""
-        return [self.tet_v]
-    
-    def export(self, path, name, save_npy=False):
-        """Export current mesh"""
-        os.makedirs(path, exist_ok=True)
-        
-        # Update tetmesh with current vertices
-        vertices_np = self.tet_v.detach().cpu().numpy()
-        current_tetmesh = WarpTetMesh(
-            vertices_np,
-            self.tetmesh.elements,
-            self.tetmesh.surface_vertices,
-            self.tetmesh.surface_faces
-        )
-        
-        # Export surface mesh
-        mesh_path = os.path.join(path, f"{name}.obj")
-        current_tetmesh.export_mesh(mesh_path)
-        
-        if save_npy:
-            np.save(os.path.join(path, f"{name}_vertices.npy"), vertices_np)
-
-
 def train_warp_tetsplat(cfg):
     """Main training function - supports official config format"""
     verbose = cfg.get("verbose", False)
@@ -305,13 +171,16 @@ def train_warp_tetsplat(cfg):
             
             # Depth loss (same as original)
             if fit_depth:
-                depth_loss = torch.nn.MSELoss()(out["d"][..., -1], batch["d"][..., -1])
-                img_loss += depth_loss
+                img_loss += shade_loss(out["d"][..., -1] * color_ref[..., -1],
+                                       batch["d"][..., -1] * color_ref[..., -1]) * 100
             
             # Regularization loss
             reg_loss = 0.0
             if cfg.get("fitting_stage", None) == "geometry":
-                reg_loss = out["geo_regularization"]
+                # Use smooth_barrier_energy from the geometry forward pass
+                reg_loss = out.get("geo_regularization", 0.0)
+                if reg_loss == 0.0 and hasattr(out, "smooth_barrier_energy"):
+                    reg_loss = out.smooth_barrier_energy
             
             loss = img_loss * 100 + reg_loss
             

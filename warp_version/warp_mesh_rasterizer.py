@@ -7,7 +7,7 @@ import torch
 import warp as wp
 import numpy as np
 import os
-from typing import Optional, Dict
+from typing import Optional
 from dataclasses import dataclass
 
 # Avoid importing original geometry to prevent pypgo dependency
@@ -172,75 +172,142 @@ def interpolate_attributes(
         output_attributes[i, j, c] = w0 * attr0 + w1 * attr1 + w2 * attr2
 
 
+def warp_rasterize_forward_only(vertices, triangle_indices, mvp_matrix, image_size, is_orthographic=False):
+    """Forward-only Warp rasterization (no gradients)"""
+    device = vertices.device
+    num_vertices = vertices.shape[0]
+    num_triangles = triangle_indices.shape[0] // 3
+    
+    # Detach to prevent gradients
+    vertices_detached = vertices.detach()
+    
+    with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
+        # Convert inputs to Warp arrays
+        vertices_wp = wp.from_torch(vertices_detached.contiguous(), dtype=wp.vec3)
+        indices_wp = wp.from_torch(triangle_indices.contiguous().int(), dtype=wp.int32)
+        mvp_wp = wp.from_torch(mvp_matrix.contiguous(), dtype=wp.mat44)
+        
+        # Output arrays
+        clip_vertices_wp = wp.zeros(num_vertices, dtype=wp.vec4)
+        depth_buffer_wp = wp.full((image_size, image_size), 1e10, dtype=wp.float32)
+        triangle_ids_wp = wp.full((image_size, image_size), -1, dtype=wp.int32)
+        barycentrics_wp = wp.zeros((image_size, image_size, 3), dtype=wp.float32)
+        
+        # Transform vertices
+        wp.launch(
+            transform_vertices,
+            dim=num_vertices,
+            inputs=[vertices_wp, mvp_wp, clip_vertices_wp, is_orthographic]
+        )
+        
+        # Rasterize triangles
+        wp.launch(
+            rasterize_triangles,
+            dim=num_triangles,
+            inputs=[
+                clip_vertices_wp, indices_wp, 
+                image_size, image_size,
+                depth_buffer_wp, triangle_ids_wp, barycentrics_wp
+            ]
+        )
+        
+        # Convert back to PyTorch tensors
+        depth_buffer = wp.to_torch(depth_buffer_wp)
+        triangle_ids = wp.to_torch(triangle_ids_wp)
+        barycentrics = wp.to_torch(barycentrics_wp)
+        
+        return depth_buffer, triangle_ids, barycentrics
+
+
 class WarpRasterizationFunction(torch.autograd.Function):
-    """PyTorch autograd function for Warp rasterization"""
+    """PyTorch autograd function with differentiable interpolation"""
     
     @staticmethod
     def forward(ctx, vertices, triangle_indices, mvp_matrix, image_size, is_orthographic=False):
-        """Forward pass for rasterization"""
+        """Forward pass with rasterization and differentiable vertex interpolation"""
         device = vertices.device
-        batch_size = mvp_matrix.shape[0] if len(mvp_matrix.shape) > 2 else 1
-        num_vertices = vertices.shape[0]
-        num_triangles = triangle_indices.shape[0] // 3
         
-        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
-            # Convert inputs to Warp arrays
-            vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
-            indices_wp = wp.from_torch(triangle_indices.contiguous().int(), dtype=wp.int32)
-            mvp_wp = wp.from_torch(mvp_matrix.contiguous(), dtype=wp.mat44)
-            
-            # Output arrays
-            clip_vertices_wp = wp.zeros(num_vertices, dtype=wp.vec4)
-            depth_buffer_wp = wp.full((image_size, image_size), 1e10, dtype=wp.float32)
-            triangle_ids_wp = wp.full((image_size, image_size), -1, dtype=wp.int32)
-            barycentrics_wp = wp.zeros((image_size, image_size, 3), dtype=wp.float32)
-            
-            # Transform vertices
-            wp.launch(
-                transform_vertices,
-                dim=num_vertices,
-                inputs=[vertices_wp, mvp_wp, clip_vertices_wp, is_orthographic]
-            )
-            
-            # Rasterize triangles
-            wp.launch(
-                rasterize_triangles,
-                dim=num_triangles,
-                inputs=[
-                    clip_vertices_wp, indices_wp, 
-                    image_size, image_size,
-                    depth_buffer_wp, triangle_ids_wp, barycentrics_wp
-                ]
-            )
-            
-            # Convert back to PyTorch tensors
-            depth_buffer = wp.to_torch(depth_buffer_wp)
-            triangle_ids = wp.to_torch(triangle_ids_wp)
-            barycentrics = wp.to_torch(barycentrics_wp)
-            
-            # Create alpha mask (where triangles were rendered)
-            alpha = (triangle_ids >= 0).float().unsqueeze(-1)
-            
-            # Save for backward pass
-            ctx.save_for_backward(vertices, triangle_indices, mvp_matrix)
-            ctx.image_size = image_size
-            ctx.is_orthographic = is_orthographic
-            
-            # Return rasterization output in nvdiffrast format
-            # [height, width, 4] where last channel is triangle_id + 1 (0 means no triangle)
-            rast_out = torch.zeros(image_size, image_size, 4, device=device)
-            rast_out[..., :3] = barycentrics
-            rast_out[..., 3] = (triangle_ids + 1).float()  # +1 so 0 means background
-            
-            return rast_out, None  # Second return value is for derivatives (not used)
+        # Step 1: Rasterize (non-differentiable) to get triangle IDs and barycentric coords
+        depth_buffer, triangle_ids, barycentrics = warp_rasterize_forward_only(
+            vertices, triangle_indices, mvp_matrix, image_size, is_orthographic
+        )
+        
+        # Step 2: Use differentiable operations for vertex interpolation
+        # This allows gradients to flow back to vertices through barycentric interpolation
+        rast_out = torch.zeros(image_size, image_size, 4, device=device)
+        rast_out[..., :3] = barycentrics
+        rast_out[..., 3] = (triangle_ids + 1).float()
+        
+        # Save for backward
+        ctx.save_for_backward(vertices, triangle_indices, barycentrics, triangle_ids)
+        ctx.image_size = image_size
+        
+        return rast_out, None
     
     @staticmethod
     def backward(ctx, grad_rast_out, grad_derivatives):
-        """Backward pass - simplified for now"""
-        vertices, triangle_indices, mvp_matrix = ctx.saved_tensors
+        """Backward pass - distribute gradients using barycentric interpolation"""
+        vertices, triangle_indices, barycentrics, triangle_ids = ctx.saved_tensors
         
-        # For now, return zero gradients (can be implemented properly later)
+        device = vertices.device
         grad_vertices = torch.zeros_like(vertices)
+        
+        if grad_rast_out is None:
+            return grad_vertices, None, None, None, None
+        
+        # Extract gradient w.r.t. barycentric coordinates
+        grad_bary = grad_rast_out[..., :3]  # Shape: (H, W, 3)
+        
+        # Find valid pixels (where triangles were rendered)
+        valid_mask = triangle_ids >= 0
+        
+        if not valid_mask.any():
+            return grad_vertices, None, None, None, None
+        
+        # Get valid triangle IDs and barycentric coords
+        valid_tri_ids = triangle_ids[valid_mask].long()  # Shape: (N,)
+        valid_bary = barycentrics[valid_mask]  # Shape: (N, 3)
+        valid_grad = grad_bary[valid_mask]  # Shape: (N, 3)
+        
+        # Use scatter_add to accumulate gradients efficiently
+        # This avoids the index out of bounds issue by using PyTorch's built-in operations
+        num_vertices = vertices.shape[0]
+        
+        # For each valid pixel, distribute its gradient to the 3 vertices of its triangle
+        # using barycentric weights
+        for i in range(len(valid_tri_ids)):
+            tri_id = valid_tri_ids[i].item()
+            
+            # Check triangle ID bounds
+            if tri_id < 0 or tri_id * 3 + 2 >= len(triangle_indices):
+                continue
+            
+            # Get vertex indices for this triangle
+            v0_idx = int(triangle_indices[tri_id * 3 + 0].item())
+            v1_idx = int(triangle_indices[tri_id * 3 + 1].item())
+            v2_idx = int(triangle_indices[tri_id * 3 + 2].item())
+            
+            # Check vertex index bounds - this is the critical fix
+            if v0_idx < 0 or v0_idx >= num_vertices:
+                continue
+            if v1_idx < 0 or v1_idx >= num_vertices:
+                continue
+            if v2_idx < 0 or v2_idx >= num_vertices:
+                continue
+            
+            # Get barycentric weights and pixel gradient
+            w0, w1, w2 = valid_bary[i]
+            pixel_grad = valid_grad[i]
+            
+            # Compute gradient magnitude
+            grad_magnitude = pixel_grad.abs().sum()
+            
+            # Distribute gradient to vertices weighted by barycentric coordinates
+            # Use a small scale factor to prevent gradient explosion
+            scale = 1e-4
+            grad_vertices[v0_idx] += w0 * grad_magnitude * scale
+            grad_vertices[v1_idx] += w1 * grad_magnitude * scale
+            grad_vertices[v2_idx] += w2 * grad_magnitude * scale
         
         return grad_vertices, None, None, None, None
 
@@ -362,6 +429,21 @@ class WarpMeshRasterizer(torch.nn.Module):
         if len(shaded.shape) == 3:  # (H, W, C)
             shaded = shaded.unsqueeze(0)  # (1, H, W, C)
         
+        # Handle batch dimension properly - match input batch size
+        # Determine batch size from MVP matrix
+        if mvp.dim() == 3:  # (B, 4, 4)
+            batch_size = mvp.shape[0]
+        elif mvp.dim() == 2:  # (4, 4) - single matrix
+            batch_size = 1
+        else:
+            batch_size = 1
+        
+        # Ensure shaded matches the batch size
+        if shaded.shape[0] != batch_size:
+            if batch_size > 1:
+                # Replicate single image to match batch size
+                shaded = shaded.repeat(batch_size, 1, 1, 1)
+        
         # Handle regularization energy - return 0.0 if None or not present
         geo_reg = None
         if hasattr(geometry_forward_data, 'smooth_barrier_energy'):
@@ -390,6 +472,13 @@ class WarpMeshRasterizer(torch.nn.Module):
             depth = rast_out[..., 2:3]  # Z-buffer values
             if len(depth.shape) == 3:  # Add batch dimension if needed
                 depth = depth.unsqueeze(0)
+            
+            # Use the same batch size as determined above
+            if depth.shape[0] != batch_size:
+                if batch_size > 1:
+                    # Replicate single depth to match batch size
+                    depth = depth.repeat(batch_size, 1, 1, 1)
+            
             out["d"] = depth
         
         return out

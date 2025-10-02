@@ -4,7 +4,6 @@ Replaces the CUDA extension with Warp kernels for easier development and mainten
 """
 
 import numpy as np
-import torch
 import warp as wp
 from typing import Optional
 import trimesh
@@ -130,96 +129,6 @@ def compute_barrier_energy_backward(
     wp.atomic_add(grad_vertices, v3_idx, grad_e3)
 
 
-class WarpBarrierEnergy(torch.autograd.Function):
-    """PyTorch autograd function for Warp-based barrier energy"""
-    
-    @staticmethod
-    def forward(ctx, vertices, tet_elements, rest_matrices, smooth_coeff, barrier_coeff, order):
-        device = vertices.device
-        batch_size = vertices.shape[0] if len(vertices.shape) > 1 else 1
-        num_tets = tet_elements.shape[0] // 4
-        
-        # Convert to Warp arrays
-        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
-            vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
-            elements_wp = wp.from_torch(tet_elements.contiguous().int(), dtype=wp.int32)  # Convert to int32
-            rest_wp = wp.from_torch(rest_matrices.contiguous(), dtype=wp.mat33)
-            
-            # Allocate outputs
-            def_grads_wp = wp.zeros(num_tets, dtype=wp.mat33)
-            energies_wp = wp.zeros(num_tets, dtype=wp.float32)
-            
-            # Compute deformation gradients
-            wp.launch(
-                compute_tet_deformation_gradient,
-                dim=num_tets,
-                inputs=[vertices_wp, elements_wp, rest_wp, def_grads_wp]
-            )
-            
-            # Compute barrier energies
-            wp.launch(
-                compute_barrier_energy_forward,
-                dim=num_tets,
-                inputs=[def_grads_wp, energies_wp, order]
-            )
-            
-            # Convert back to torch
-            energies_torch = wp.to_torch(energies_wp)
-            total_energy = barrier_coeff * torch.sum(energies_torch)
-            
-            # Save for backward
-            ctx.save_for_backward(vertices, tet_elements, rest_matrices)
-            ctx.coeffs = (smooth_coeff, barrier_coeff)
-            ctx.order = order
-            
-            return total_energy
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        vertices, tet_elements, rest_matrices = ctx.saved_tensors
-        smooth_coeff, barrier_coeff = ctx.coeffs
-        order = ctx.order
-        
-        device = vertices.device
-        num_vertices = vertices.shape[0]
-        num_tets = tet_elements.shape[0] // 4
-        
-        with wp.ScopedDevice(f"cuda:{device.index}" if device.type == 'cuda' else 'cpu'):
-            vertices_wp = wp.from_torch(vertices.contiguous(), dtype=wp.vec3)
-            elements_wp = wp.from_torch(tet_elements.contiguous().int(), dtype=wp.int32)  # Convert to int32
-            rest_wp = wp.from_torch(rest_matrices.contiguous(), dtype=wp.mat33)
-            
-            # Recompute deformation gradients
-            def_grads_wp = wp.zeros(num_tets, dtype=wp.mat33)
-            wp.launch(
-                compute_tet_deformation_gradient,
-                dim=num_tets,
-                inputs=[vertices_wp, elements_wp, rest_wp, def_grads_wp]
-            )
-            
-            # Compute gradients
-            grad_vertices_wp = wp.zeros(num_vertices, dtype=wp.vec3)
-            
-            # Handle scalar grad_output properly
-            if grad_output is not None:
-                grad_scale = float(grad_output.item() * barrier_coeff) if hasattr(grad_output, 'item') else float(grad_output * barrier_coeff)
-            else:
-                grad_scale = float(barrier_coeff)
-                
-            grad_output_wp = wp.full(num_tets, grad_scale, dtype=wp.float32)
-            
-            wp.launch(
-                compute_barrier_energy_backward,
-                dim=num_tets,
-                inputs=[vertices_wp, elements_wp, rest_wp, def_grads_wp, 
-                        grad_output_wp, grad_vertices_wp, order]
-            )
-            
-            grad_vertices_torch = wp.to_torch(grad_vertices_wp)
-            
-        return grad_vertices_torch, None, None, None, None, None
-
-
 class WarpTetMesh:
     """Warp-based tetrahedral mesh for shape fitting"""
     
@@ -249,33 +158,40 @@ class WarpTetMesh:
         self._compute_rest_matrices()
         
     def _extract_surface(self):
-        """Extract surface vertices and faces from tetrahedral mesh"""
-        # Simple surface extraction - can be improved
-        face_count = {}
-        all_faces = []
+        """Extract surface vertices and faces from tetrahedral mesh - matches original implementation"""
+        # Generate all faces from tetrahedra (4 faces per tet)
+        org_triangles = np.vstack([
+            self.elements[:, [1, 2, 3]],
+            self.elements[:, [0, 3, 2]],
+            self.elements[:, [0, 1, 3]],
+            self.elements[:, [0, 2, 1]],
+        ])
         
-        # Generate all faces from tetrahedra
-        for tet in self.elements:
-            faces = [
-                tuple(sorted([tet[0], tet[1], tet[2]])),
-                tuple(sorted([tet[0], tet[1], tet[3]])), 
-                tuple(sorted([tet[0], tet[2], tet[3]])),
-                tuple(sorted([tet[1], tet[2], tet[3]]))
-            ]
-            
-            for face in faces:
-                if face in face_count:
-                    face_count[face] += 1
-                else:
-                    face_count[face] = 1
-                    all_faces.append(face)
+        # Sort each triangle's vertices to avoid duplicates due to ordering
+        triangles = np.sort(org_triangles, axis=1)
         
-        # Surface faces appear only once
-        surface_faces = [face for face in all_faces if face_count[face] == 1]
-        surface_vertices = list(set([v for face in surface_faces for v in face]))
+        # Find unique triangles and their counts
+        unique_triangles, tri_idx, counts = np.unique(
+            triangles, axis=0, return_index=True, return_counts=True
+        )
         
-        self.surface_faces = np.array([[face[0], face[1], face[2]] for face in surface_faces])
-        self.surface_vertices = np.array(sorted(surface_vertices))
+        # Surface triangles appear only once (not shared between tets)
+        once_tri_id = counts == 1
+        surface_triangles = unique_triangles[once_tri_id]
+        
+        # Get unique surface vertices (global indices)
+        surface_vertices = np.unique(surface_triangles)
+        
+        # CRITICAL: Map global vertex indices to local surface indices
+        # This prevents index out of bounds errors during rendering
+        vertex_mapping = {vertex_id: i for i, vertex_id in enumerate(surface_vertices)}
+        
+        # Remap triangle indices to local surface vertex indices
+        original_surface_triangles = org_triangles[tri_idx][once_tri_id]
+        mapped_triangles = np.vectorize(vertex_mapping.get)(original_surface_triangles)
+        
+        self.surface_vertices = surface_vertices.astype(np.int32)
+        self.surface_faces = mapped_triangles.astype(np.int32)
         
     def _compute_rest_matrices(self):
         """Compute rest-state deformation matrices"""
@@ -302,14 +218,12 @@ class WarpTetMesh:
                 
     def get_surface_mesh(self) -> trimesh.Trimesh:
         """Get surface mesh as trimesh object"""
+        # Get surface vertices using global indices
         surface_verts = self.vertices[self.surface_vertices]
         
-        # Remap face indices to surface vertex indices
-        vert_map = {old_idx: new_idx for new_idx, old_idx in enumerate(self.surface_vertices)}
-        remapped_faces = np.array([[vert_map[face[0]], vert_map[face[1]], vert_map[face[2]]] 
-                                  for face in self.surface_faces])
-        
-        return trimesh.Trimesh(vertices=surface_verts, faces=remapped_faces)
+        # surface_faces already contains local indices (0 to len(surface_vertices)-1)
+        # No remapping needed since _extract_surface() already did it
+        return trimesh.Trimesh(vertices=surface_verts, faces=self.surface_faces)
         
     def export_mesh(self, filepath: str):
         """Export surface mesh to file"""

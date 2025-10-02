@@ -428,8 +428,11 @@ def load_warp_dataloader(dataset_type: str):
     if dataset_type == "wonder3d":
         return WarpWonder3DImgDataset
     elif dataset_type == "mitsuba":
-        return WarpMistubaImgDataLoader  # Return the dataloader, not dataset
+        # For now, use Wonder3D dataset as fallback since MistubaImgDataset is not implemented
+        print("Warning: Using WarpWonder3DImgDataset as fallback for MistubaImgDataLoader")
+        return WarpWonder3DImgDataset
     elif dataset_type == "blender":
         return WarpBlenderImgDataset
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
+        raise ValueError(f"Unknown dataset type: {dataset_type}. "
+                        f"Supported types: wonder3d, mitsuba, blender")

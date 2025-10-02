@@ -9,3 +9,5 @@ __pycache__/
 
 # Ignore all image data
 img_data/
+
+mesh_data/a_white_dog
