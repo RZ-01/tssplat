@@ -1,8 +1,3 @@
-"""
-Warp-compatible dataloader for TetSplatting.
-Directly copied from original data loading logic.
-"""
-
 import torch
 import numpy as np
 import cv2
@@ -17,34 +12,42 @@ from utils.typing import *
 
 
 class WarpWonder3DImgDataset:
-    """Wonder3D dataset loader compatible with Warp training"""
-    
     @dataclass
     class Config:
-        camera_mvp_root: str
-        camera_views: List[str]
-        image_root: str
+        camera_mvp_root: str = ""
+        camera_views: List[str] = None
+        image_root: str = ""
+        dataset_config: Optional[dict] = None
+        world_size: int = 1
+        rank: int = 0
+        batch_size: int = 120
+        total_num_iter: int = 2000
 
     def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None):
         self.cfg = parse_structured(self.Config, cfg)
         
-        # Load image data (same as original)
+        if self.cfg.dataset_config:
+            dataset_cfg = self.cfg.dataset_config
+            self.image_root = dataset_cfg.get('image_root', self.cfg.image_root)
+            self.camera_mvp_root = dataset_cfg.get('camera_mvp_root', self.cfg.camera_mvp_root)
+            self.camera_views = dataset_cfg.get('camera_views', self.cfg.camera_views)
+        else:
+            self.image_root = self.cfg.image_root
+            self.camera_mvp_root = self.cfg.camera_mvp_root
+            self.camera_views = self.cfg.camera_views
+        
         self.all_tgt_imgs, self.all_mvp_mats, self.all_mv_mats, self.all_campos, self.all_tgt_ns, self.all_tgt_ds = self.load_img_data()
 
-        # Background as all white (same as original)
         self.bgs = [np.ones((self.all_tgt_imgs[0].shape[0], self.all_tgt_imgs[0].shape[1], 3))
                     for i in range(len(self.all_tgt_imgs))]
 
-        # Camera params (same as original)
         self.camera_p = self.all_mvp_mats[0] @ np.linalg.inv(self.all_mv_mats[0])
         self.camera_dist = np.linalg.norm(self.all_campos[0])
 
-        # Resolution and spp (same as original)
-        self.resolution = self.all_tgt_imgs[0].shape[0]  # square imgs
+        self.resolution = self.all_tgt_imgs[0].shape[0]
         self.spp = 1
 
     def load_img_data(self):
-        """Load image data - directly copied from original"""
         all_tgt_imgs = []
         all_mvp_mats = []
         all_mv_mats = []
@@ -52,49 +55,55 @@ class WarpWonder3DImgDataset:
         all_tgt_ns = []
         all_tgt_ds = []
 
-        for view in self.cfg.camera_views:
-            camera_filename = f"{self.cfg.camera_mvp_root}/{view}_mvp.npy"
-            all_mvp_mats.append(np.load(camera_filename))
+        camera_views = self.camera_views or [f"view_{i:03d}" for i in range(120)]
+        
+        for view in camera_views:
+            if self.camera_mvp_root:
+                camera_filename = f"{self.camera_mvp_root}/{view}_mvp.npy"
+                all_mvp_mats.append(np.load(camera_filename))
+            else:
+                all_mvp_mats.append(np.eye(4))
             all_tgt_imgs.append(np.zeros(1))
             all_tgt_ns.append(np.zeros(1))
 
-        # Masked images
-        img_root = os.path.dirname(self.cfg.image_root) + "/masked_colors1"
-        for img_file in os.listdir(img_root):
-            found = False
-            for i, c in enumerate(self.cfg.camera_views):
-                if c in img_file:
-                    found = True
-                    tgt_img = np.array(Image.open(os.path.join(
-                        img_root, img_file))).astype(np.float32) / 255.0
+        img_root = os.path.dirname(self.image_root) + "/masked_colors1"
+        if os.path.exists(img_root):
+            for img_file in os.listdir(img_root):
+                found = False
+                for i, c in enumerate(camera_views):
+                    if c in img_file:
+                        found = True
+                        tgt_img = np.array(Image.open(os.path.join(
+                            img_root, img_file))).astype(np.float32) / 255.0
 
-                    tgt_img = cv2.resize(tgt_img, (512, 512), cv2.INTER_CUBIC)
-                    tgt_img[..., 3] = np.where(tgt_img[..., 3] < 0.8, 0, 1)
+                        tgt_img = cv2.resize(tgt_img, (512, 512), cv2.INTER_CUBIC)
+                        tgt_img[..., 3] = np.where(tgt_img[..., 3] < 0.8, 0, 1)
 
-                    all_tgt_imgs[i] = tgt_img
-                    break
+                        all_tgt_imgs[i] = tgt_img
+                        break
 
-            assert found
+                if not found:
+                    print(f"Warning: No matching view found for {img_file}")
 
-        # Normal images
-        img_root = os.path.dirname(self.cfg.image_root) + "/normals"
-        for img_file in os.listdir(img_root):
-            found = False
-            for i, c in enumerate(self.cfg.camera_views):
-                if c in img_file:
-                    found = True
-                    tgt_img = np.array(Image.open(os.path.join(
-                        img_root, img_file))).astype(np.float32) / 255.0
+        img_root = os.path.dirname(self.image_root) + "/normals"
+        if os.path.exists(img_root):
+            for img_file in os.listdir(img_root):
+                found = False
+                for i, c in enumerate(camera_views):
+                    if c in img_file:
+                        found = True
+                        tgt_img = np.array(Image.open(os.path.join(
+                            img_root, img_file))).astype(np.float32) / 255.0
 
-                    tgt_img = cv2.resize(tgt_img, (512, 512), cv2.INTER_CUBIC)
-                    tgt_img[..., 0:3] = (tgt_img[..., 0:3] - 0.5) * 2
+                        tgt_img = cv2.resize(tgt_img, (512, 512), cv2.INTER_CUBIC)
+                        tgt_img[..., 0:3] = (tgt_img[..., 0:3] - 0.5) * 2
 
-                    all_tgt_ns[i] = tgt_img
-                    break
+                        all_tgt_ns[i] = tgt_img
+                        break
 
-            assert found
+                if not found:
+                    print(f"Warning: No matching view found for normal {img_file}")
 
-        # Process loaded data
         imgs = []
         mvps = []
         ns = []
@@ -117,33 +126,26 @@ class WarpWonder3DImgDataset:
 
 
 class WarpMistubaImgDataset:
-    """Mitsuba dataset loader compatible with Warp training"""
     
     @dataclass
     class Config:
         image_root: str
 
-    def __init__(self, cfg):  # Accept direct config object, not parsed dict
-        # cfg should be already parsed MistubaImgDataset.Config
+    def __init__(self, cfg):
         self.cfg = cfg
         
-        # Load image data (same as original)
         self.all_tgt_imgs, self.all_mvp_mats, self.all_mv_mats, self.all_campos, self.all_tgt_ns, self.all_tgt_ds = self.load_img_data()
 
-        # Background as all white (same as original)
         self.bgs = [np.ones((self.all_tgt_imgs[0].shape[0], self.all_tgt_imgs[0].shape[1], 3))
                     for i in range(len(self.all_tgt_imgs))]
 
-        # Camera params (same as original)
         self.camera_p = self.all_mvp_mats[0] @ np.linalg.inv(self.all_mv_mats[0])
         self.camera_dist = np.linalg.norm(self.all_campos[0])
 
-        # Resolution and spp (same as original)
-        self.resolution = self.all_tgt_imgs[0].shape[0]  # square imgs
+        self.resolution = self.all_tgt_imgs[0].shape[0]
         self.spp = 1
 
     def load_img_data(self):
-        """Load image data - directly copied from original"""
         all_tgt_imgs = []
         all_mvp_mats = []
         all_mv_mats = []
@@ -186,7 +188,6 @@ class WarpMistubaImgDataset:
                 d = np.zeros_like(tgt_img)
             all_tgt_ds.append(d)
 
-            # Validation checks (same as original)
             try:
                 assert np.all(np.isfinite(tgt_img))
                 assert np.all(np.isfinite(mvp_mat))
@@ -201,8 +202,7 @@ class WarpMistubaImgDataset:
 
 
 class WarpBlenderImgDataset:
-    """Blender dataset loader for Warp training (simplified version)"""
-    
+
     @dataclass
     class Config:
         image_root: str
@@ -211,28 +211,22 @@ class WarpBlenderImgDataset:
     def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None):
         self.cfg = parse_structured(self.Config, cfg)
         
-        # Load image data 
         self.all_tgt_imgs, self.all_mvp_mats, self.all_mv_mats, self.all_campos, self.all_tgt_ns, self.all_tgt_ds = self.load_img_data()
 
-        # Background as all white
         self.bgs = [np.ones((self.cfg.resolution, self.cfg.resolution, 3))
                     for i in range(len(self.all_tgt_imgs))]
 
-        # Camera params
         if len(self.all_mvp_mats) > 0:
             self.camera_p = self.all_mvp_mats[0] @ np.linalg.inv(self.all_mv_mats[0])
             self.camera_dist = np.linalg.norm(self.all_campos[0])
         else:
-            # Default values
             self.camera_p = np.eye(4)
             self.camera_dist = 1.0
 
-        # Resolution and spp
         self.resolution = self.cfg.resolution
         self.spp = 1
 
     def load_img_data(self):
-        """Load Blender-style data"""
         all_tgt_imgs = []
         all_mvp_mats = []
         all_mv_mats = []
@@ -264,20 +258,16 @@ class WarpBlenderImgDataset:
                     img = cv2.resize(img, (self.cfg.resolution, self.cfg.resolution), cv2.INTER_CUBIC)
                     all_tgt_imgs.append(img)
                     
-                    # Transform matrix
                     transform_matrix = np.array(frame['transform_matrix'])
                     all_mv_mats.append(transform_matrix)
                     
-                    # For MVP, we'd need projection matrix (using identity for now)
-                    proj_matrix = np.eye(4)  # Simplified
+                    proj_matrix = np.eye(4)
                     mvp_matrix = proj_matrix @ transform_matrix
                     all_mvp_mats.append(mvp_matrix.astype(np.float32))
                     
-                    # Camera position
                     campos = transform_matrix[:3, 3]
                     all_campos.append(campos)
                     
-                    # Dummy normal and depth
                     all_tgt_ns.append(np.zeros_like(img))
                     all_tgt_ds.append(img[..., -1:] if img.shape[-1] > 3 else np.ones_like(img[..., :1]))
 
@@ -285,8 +275,7 @@ class WarpBlenderImgDataset:
 
 
 class WarpDataLoader:
-    """Warp-compatible dataloader - directly copied logic from original"""
-    
+
     @dataclass
     class Config:
         batch_size: int
@@ -299,15 +288,12 @@ class WarpDataLoader:
         self.device = get_device()
         self.dataset = dataset
         
-        # Convert to torch tensors (same as original)
         self.to_torch()
         
-        # Set batch properties
         self.n_images = len(self.dataset.all_tgt_imgs)
         self.num_forward_per_iter = max(1, self.cfg.batch_size // self.n_images)
 
     def to_torch(self):
-        """Convert numpy arrays to torch tensors - directly copied from original"""
         self.img = torch.tensor(np.array(self.dataset.all_tgt_imgs),
                                dtype=torch.float32).to(self.device)
         self.n = torch.tensor(np.array(self.dataset.all_tgt_ns),
@@ -323,7 +309,6 @@ class WarpDataLoader:
         self.bg = torch.tensor(np.array(self.dataset.bgs),
                               dtype=torch.float32).to(self.device)
 
-        # Combine background with images (same as original)
         self.img = torch.cat(
             (torch.lerp(self.bg, self.img[..., 0:3], self.img[..., 3:4]), self.img[..., 3:4]), 
             dim=-1
@@ -333,12 +318,10 @@ class WarpDataLoader:
         self.iter_spp = self.dataset.spp
 
     def __call__(self, iter_num: int, forward_id: int = 0) -> Dict[str, torch.Tensor]:
-        """Get batch data - same logic as original"""
-        # Simple round-robin selection for now
         idx = (iter_num * self.num_forward_per_iter + forward_id) % self.n_images
         
         return {
-            "img": self.img[idx:idx+1],  # Add batch dimension
+            "img": self.img[idx:idx+1],
             "n": self.n[idx:idx+1],
             "d": self.d[idx:idx+1], 
             "mv": self.mv[idx:idx+1],
@@ -353,7 +336,6 @@ class WarpDataLoader:
 
 
 class WarpMistubaImgDataLoader:
-    """Warp version of MistubaImgDataLoader - matches original structure"""
     
     @dataclass 
     class Config:
@@ -367,15 +349,11 @@ class WarpMistubaImgDataLoader:
         self.cfg = parse_structured(self.Config, cfg)
         self.device = get_device()
         
-        # Create dataset using dataset_config
         self.dataset = WarpMistubaImgDataset(self.cfg.dataset_config)
         
-        # Prepare data (same as original)
         self.prepare_data()
     
     def prepare_data(self):
-        """Prepare data - copied from original"""
-        # Convert to torch tensors (same as original DataLoader.to_torch)
         self.img = torch.tensor(np.array(self.dataset.all_tgt_imgs),
                                dtype=torch.float32).to(self.device)
         self.n = torch.tensor(np.array(self.dataset.all_tgt_ns),
@@ -391,11 +369,9 @@ class WarpMistubaImgDataLoader:
         self.bg = torch.tensor(np.array(self.dataset.bgs),
                               dtype=torch.float32).to(self.device)
         
-        # Apply background blending (same as original)
         self.img = torch.cat(
             (torch.lerp(self.bg, self.img[..., 0:3], self.img[..., 3:4]), self.img[..., 3:4]), dim=-1)
         
-        # Set properties
         self.n_images = len(self.dataset.all_tgt_imgs)
         self.num_forward_per_iter = max(1, self.cfg.batch_size // self.n_images)
         self.resolution = self.dataset.resolution
@@ -404,9 +380,7 @@ class WarpMistubaImgDataLoader:
         return self.n_images
     
     def __call__(self, iter_num, forw_id):
-        """Generate batch - same logic as original"""
         with torch.no_grad():
-            # Random indices selection (same as original)
             indices = np.random.randint(0, self.n_images, size=self.cfg.batch_size)
             
             batch = {
@@ -424,11 +398,9 @@ class WarpMistubaImgDataLoader:
 
 
 def load_warp_dataloader(dataset_type: str):
-    """Factory function to load appropriate dataset type"""
     if dataset_type == "wonder3d":
         return WarpWonder3DImgDataset
     elif dataset_type == "mitsuba":
-        # For now, use Wonder3D dataset as fallback since MistubaImgDataset is not implemented
         print("Warning: Using WarpWonder3DImgDataset as fallback for MistubaImgDataLoader")
         return WarpWonder3DImgDataset
     elif dataset_type == "blender":

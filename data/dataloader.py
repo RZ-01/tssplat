@@ -10,6 +10,45 @@ import random
 from dataclasses import dataclass, field
 
 
+class MeshFittingDataLoader:
+    
+    @dataclass
+    class Config:
+        batch_size: int
+        total_num_iter: int
+        world_size: int
+        rank: int
+        dataset_config: Optional[dict] = None  # for compatibility
+
+    def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None):
+        self.cfg = parse_structured(self.Config, cfg)
+        self.device = get_device()
+        
+        # This ensures compatibility with the existing training loop
+        self.num_forward_per_iter = 1 
+        
+        # dummy data 
+        self.resolution = 512
+        batch_size = self.cfg.batch_size
+        
+        # dummy tensors 
+        self.dummy_img = torch.zeros(batch_size, self.resolution, self.resolution, 4).to(self.device)
+        self.dummy_mvp = torch.eye(4).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+        self.dummy_campos = torch.zeros(batch_size, 3).to(self.device)
+        self.dummy_background = torch.zeros(batch_size, self.resolution, self.resolution, 3).to(self.device)
+        
+    def __call__(self, iter_num, forw_id):
+        # dummy data
+        return {
+            "img": self.dummy_img,
+            "mvp": self.dummy_mvp,
+            "campos": self.dummy_campos,
+            "resolution": self.resolution,
+            "background": self.dummy_background,
+            "d": self.dummy_img[..., -1:], 
+        }
+
+
 class DataLoader:
     @dataclass
     class Config:

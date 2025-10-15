@@ -77,6 +77,23 @@ class MeshRasterizer(torch.nn.Module):
                 res[..., 2] /= 6
 
         return res
+    
+    def compute_geometry_forward(self, iter_num: int, permute_surface_scheduler=None):
+        geo_input = {"iter_num": iter_num}
+
+        if permute_surface_scheduler is not None:
+            permute_dev = permute_surface_scheduler(iter_num)
+            if permute_dev is not None:
+                geo_input["permute_surface_v"] = True
+                geo_input["permute_surface_v_dev"] = permute_dev
+
+        geometry_forward_data = self.geometry(**geo_input)
+
+        out = {
+            "geo_regularization": geometry_forward_data.smooth_barrier_energy
+        }
+
+        return out
 
     def forward(self, mvp: torch.Tensor,
                 only_alpha: bool,

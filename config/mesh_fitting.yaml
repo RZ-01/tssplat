@@ -1,0 +1,67 @@
+expr_name: "mesh_fitting"
+fitting_stage: geometry 
+
+geometry_type: TetMeshMultiSphereGeometry
+geometry:
+  initial_mesh_path: ""
+  use_smooth_barrier: true
+  smooth_barrier_param:
+    smooth_eng_coeff: 2e-4
+    barrier_coeff: 2e-4      
+    increase_order_iter: 1000
+
+  template_surface_sphere_path: "mesh_data/s.1.obj"
+  key_points_file_path: "mesh_data/${expr_name}/${expr_name}.json"
+
+  tetwild_exec: "/home/featurize/work/tssplat/TetWild/build/TetWild"
+  tetwild_cache_folder: ".tetwild_cache"
+  load_precomputed_tetwild_mesh: false
+  
+
+  debug_mode: false
+
+material_type: None
+
+# Target mesh for fitting
+target_mesh_path: "./jro_head_014.obj"
+mesh_loss_weight: 10000
+reg_loss_weight: 0.05 
+mesh_loss_sample_ratio: 1 
+
+# High-quality sphere generation parameters (like original code)
+surf_res: 10000          # Grid resolution for surface mesh generation (higher = more detailed)
+pc_res: 10000           # Grid resolution controlling number of candidate points (higher = more spheres)
+radius_scale: 2.5    # Scale factor for sphere radius
+offset: 0.06           # Offset for sphere radius
+remesh_edge_length: 0.08  # Edge length for mesh remeshing
+
+dataloader_type: "MeshFittingDataLoader"
+data:
+  dataset_config:
+    image_root: "img_data/${expr_name}"
+  world_size: 1
+  rank: 0
+  batch_size: 2000  # Keep original batch size
+  total_num_iter: 15000
+
+renderer:
+  context_type: "cuda"
+  is_orhto: false
+
+optimizer:
+  lr: 0.2  # Keep original learning rate
+  grad_limit: true
+  grad_limit_values: [0.01, 0.01]
+  grad_limit_iters: [1500]
+
+output_path: "results/${expr_name}"
+total_num_iter: ${data.total_num_iter}
+use_permute_surface_v: True  # Keep original setting
+permute_surface_v_param:
+  start_iter: 1500
+  end_iter: ${data.total_num_iter}
+  freq: 1000
+  start_val: 0.01
+  end_val: 0.001
+
+verbose: False  # Keep original setting

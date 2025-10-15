@@ -1,8 +1,3 @@
-"""
-Complete Warp-based TetSplatting trainer.
-Directly replicates the original trainer.py logic but uses Warp components.
-"""
-
 import os
 import sys
 import argparse
@@ -13,7 +8,6 @@ from tqdm import trange, tqdm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-# Conditional import of materials only when needed to avoid nvdiffrast dependency
 try:
     from materials import load_material
     MATERIALS_AVAILABLE = True
@@ -23,24 +17,11 @@ except ImportError:
 
 from utils.config import load_config
 from utils.optimizer import AdamUniform
-
-# Skip original renderer import to avoid pypgo dependency
-# from renderers import MeshRasterizer
 from warp_mesh_rasterizer import WarpMeshRasterizer
-
-from warp_dataloader import WarpDataLoader, load_warp_dataloader
 from warp_image_loss import WarpImageLoss
 from warp_tetmesh import WarpTetMesh, load_tetmesh_from_surface_mesh
 from warp_geometry import load_warp_geometry
-
-
-class TetMeshGeometryForwardData:
-    def __init__(self, tet_v, tet_elem, surface_vid, surface_f, smooth_barrier_energy=None):
-        self.tet_v = tet_v
-        self.tet_elem = tet_elem
-        self.v_pos = tet_v[surface_vid] if surface_vid is not None else tet_v
-        self.t_pos_idx = surface_f
-        self.smooth_barrier_energy = smooth_barrier_energy
+from warp_dataloader import load_warp_dataloader
 
 
 class LinearInterpolateScheduler:
@@ -54,19 +35,15 @@ class LinearInterpolateScheduler:
     def __call__(self, iter):
         if iter < self.start_iter or iter % self.freq != 0 or iter == 0:
             return None
-
         p = (iter - self.start_iter) / (self.end_iter - self.start_iter)
         return self.start_val * (1 - p) + self.end_val * p
 
 
 def train_warp_tetsplat(cfg):
-    """Main training function - supports official config format"""
     verbose = cfg.get("verbose", False)
-    # Setup material
     material = None
     os.makedirs(os.path.join(cfg.output_path, "final/"), exist_ok=True)
     
-    # Loss function setup - match original trainer exactly  
     shade_loss = torch.nn.MSELoss()
     if cfg.get("fitting_stage", None) == "texture":
         if not MATERIALS_AVAILABLE:
@@ -75,15 +52,11 @@ def train_warp_tetsplat(cfg):
         material = load_material(cfg.material_type)(cfg.material)
         shade_loss = torch.nn.L1Loss()
     
-    # Load geometry - use dynamic loading to match original trainer exactly
     geometry_class = load_warp_geometry(cfg.geometry_type)
     geometry = geometry_class(cfg.geometry)
     
-    # Use Warp renderer to avoid pypgo dependency
     renderer = WarpMeshRasterizer(geometry, material, cfg.renderer)
     
-    # Use Warp dataloader with official config format
-    # Map official dataloader names to Warp implementations with fallback
     dataloader_mapping = {
         "MistubaImgDataLoader": "mitsuba",
         "Wonder3DDataLoader": "wonder3d", 
@@ -92,7 +65,6 @@ def train_warp_tetsplat(cfg):
         "NeRFDataLoader": "nerf"
     }
     
-    # Try mapped name first, then direct name, then default fallback
     warp_dataloader_type = dataloader_mapping.get(cfg.dataloader_type, cfg.dataloader_type)
     
     try:
@@ -106,22 +78,18 @@ def train_warp_tetsplat(cfg):
             print("Available Warp dataloaders:", list(dataloader_mapping.values()))
             raise NotImplementedError(f"Unsupported dataloader type: {cfg.dataloader_type}")
     
-    dataloader = dataset_class(cfg.data)  # cfg.data contains all dataloader config
-    
+    dataloader = dataset_class(cfg.data)
     num_forward_per_iter = dataloader.num_forward_per_iter
     
-    # Optimizer - use AdamUniform to match original trainer
     optimizer = AdamUniform(renderer.parameters(), **cfg.optimizer)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, cfg.total_num_iter * num_forward_per_iter, eta_min=1e-4)
     
-    # Permute surface scheduler (same as original)
     permute_surface_scheduler = None
     if cfg.get('use_permute_surface_v', False):
         permute_surface_scheduler = LinearInterpolateScheduler(
             **cfg.permute_surface_v_param)
     
-    # Training state tracking
     best_loss = 1e10
     best_loss_iter = 0
     best_opt_imgs = None
@@ -132,19 +100,16 @@ def train_warp_tetsplat(cfg):
     print(f"Forward passes per iteration: {num_forward_per_iter}")
     print(f"Dataset size: {len(dataloader)}")
     
-    # Main training loop - directly copied from original
     for it in trange(cfg.total_num_iter):
         for forw_id in range(num_forward_per_iter):
             batch = dataloader(it, forw_id)
             
             color_ref = batch["img"]
             
-            # Depth fitting setup (same as original)
             fit_depth = cfg.get("fit_depth", False)
             if fit_depth:
                 fit_depth = cfg.get("fit_depth_starting_iter", 0) < it
             
-            # Renderer input (same as original)
             renderer_input = {
                 "mvp": batch["mvp"],
                 "only_alpha": cfg.get("fitting_stage", None) == "geometry",
@@ -156,48 +121,38 @@ def train_warp_tetsplat(cfg):
                 "campos": batch["campos"],
             }
             
-            # Forward pass
             out = renderer(**renderer_input)
             
-            # Compute losses - match original trainer exactly
             if cfg.get("fitting_stage", None) == "geometry":
-                # Geometry fitting: MSE loss on alpha channel (like original)
                 img_loss = shade_loss(out["shaded"][..., -1], color_ref[..., -1])
             else:
-                # Texture fitting: L1 loss on RGB channels
                 img_loss = shade_loss(out["shaded"][..., :3], color_ref[..., :3])
             
-            img_loss *= 20  # Match original scaling
+            img_loss *= 20
             
-            # Depth loss (same as original)
             if fit_depth:
                 img_loss += shade_loss(out["d"][..., -1] * color_ref[..., -1],
                                        batch["d"][..., -1] * color_ref[..., -1]) * 100
             
-            # Regularization loss
             reg_loss = 0.0
             if cfg.get("fitting_stage", None) == "geometry":
-                # Use smooth_barrier_energy from the geometry forward pass
                 reg_loss = out.get("geo_regularization", 0.0)
                 if reg_loss == 0.0 and hasattr(out, "smooth_barrier_energy"):
                     reg_loss = out.smooth_barrier_energy
             
             loss = img_loss * 100 + reg_loss
             
-            # Logging (same format as original)
-            if True:  # it % 100 == 0:
+            if True:
                 tqdm.write(
                     "iter=%4d, img_loss=%.4f, reg_loss=%.4f"
                     % (it, img_loss, reg_loss)
                 )
             
-            # Backward pass (same as original)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             scheduler.step()
             
-            # Best model tracking (same as original)
             cur_loss = loss.clone().detach().cpu().item()
             if cur_loss < best_loss:
                 best_loss = cur_loss
@@ -206,7 +161,6 @@ def train_warp_tetsplat(cfg):
                     best_v = geometry.tet_v.clone().detach()
                 best_opt_imgs = out["shaded"].clone().detach()
             
-            # Periodic saves and visualization (same as original)
             if it % 100 == 0 and forw_id == 0:
                 os.makedirs(f"{cfg.output_path}/mesh{it:05d}", exist_ok=True)
                 geometry.export(f"{cfg.output_path}/mesh{it:05d}", f"{it:05d}")
@@ -214,7 +168,6 @@ def train_warp_tetsplat(cfg):
                 if verbose:
                     chosen_idx = np.random.randint(0, batch["img"].shape[0])
                     opt_img = out["shaded"][chosen_idx].clone().detach()
-                    # Save images
                     img = opt_img.cpu().numpy()
 
                     print(img.shape)
@@ -236,7 +189,6 @@ def train_warp_tetsplat(cfg):
 
                     if cfg.get("fitting_stage", None) == "geometry":
                         diff = color_ref[chosen_idx].cpu().numpy()[..., -1:] - opt_img.cpu().numpy()[..., -1:]
-                        # Save images
                         img = np.abs(diff)
                         print(img.shape)
                         if img.shape[2] == 1:
@@ -248,7 +200,6 @@ def train_warp_tetsplat(cfg):
     
     print(f"Best rendering loss: {best_loss} at iteration {best_loss_iter}")
     
-    # Final export (same as original)
     geometry.export(f"{cfg.output_path}/final", "final", save_npy=True)
     
     if material is not None:
@@ -263,12 +214,9 @@ def train_warp_tetsplat(cfg):
     }
 
 
-
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Warp-based TetSplatting trainer - supports official config format")
-    parser.add_argument("--config", type=str, required=True, help="Path to official config file (e.g., img_to_3D.yaml)")
+    parser = argparse.ArgumentParser(description="Warp-based TetSplatting trainer")
+    parser.add_argument("--config", type=str, required=True, help="Path to config file")
     
     args, extras = parser.parse_known_args()
     

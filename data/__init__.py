@@ -1,4 +1,4 @@
-from .dataloader import Wonder3DDataLoader, MistubaImgDataLoader, BlenderImgDataLoader
+from .dataloader import Wonder3DDataLoader, MistubaImgDataLoader, BlenderImgDataLoader, MeshFittingDataLoader
 
 
 def load_dataloader(dataloader_class_type):
@@ -8,6 +8,8 @@ def load_dataloader(dataloader_class_type):
         return MistubaImgDataLoader
     elif dataloader_class_type == "BlenderImgDataLoader":
         return BlenderImgDataLoader
+    elif dataloader_class_type == "MeshFittingDataLoader":
+        return MeshFittingDataLoader
     else:
         raise NotImplementedError(
             f"Unknown data class type: {dataloader_class_type}")

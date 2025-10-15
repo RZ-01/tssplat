@@ -517,7 +517,7 @@ def main(tgt_path, mesh_name, save_path, radius_scale=1.1, offset=0.06, pc_res=5
     ################
 
     # generate_rough_sdf(img, mvp, pc_res,  pt_mesh_path, True)
-    print("start generate surf")
+    # print("generate pc done")
     generate_rough_sdf(img, mvp, surf_res, surf_mesh_path, False)
     print("generate surf done")
     ################
@@ -560,9 +560,9 @@ if __name__ == "__main__":
                         type=float, help="scale of radius")
     parser.add_argument("--offset", default=0.06,
                         type=float, help="offset of radius")
-    parser.add_argument("--surf_res", default=50, type=int,
+    parser.add_argument("--surf_res", default=200, type=int,
                         help="the grid resolution of coarse voxel grid")
-    parser.add_argument("--pc_res", default=50, type=int,
+    parser.add_argument("--pc_res", default=200, type=int,
                         help="the grid resolution controlling the number of initial candicate points")
     parser.add_argument("--remesh_edge_length", default=0.08,
                         type=float)
